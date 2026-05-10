@@ -1,91 +1,68 @@
 {
   "game_root": "C:/Games/RestrictedApps",
-
   "timers": {
-    "cleanup_seconds": 1800
+    "cleanup_seconds": 1800,
+    "disconnect_verify_seconds": 8
   },
-
   "power_profiles": {
     "high_performance": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
     "balanced": "381b4222-f694-41f0-9685-ff5bb260df2e",
     "power_saver": "a1841308-3541-4fab-bc81-f71556f20b4a"
   },
-
   "steam": {
     "path": "C:/Games/Steam/steam.exe",
-    "args": ["-silent"]
+    "args": [
+      "-silent"
+    ]
   },
-
   "parsec": {
     "path": "C:/Program Files/Parsec/parsecd.exe"
   },
-
   "cleanup_processes": [
     "chrome",
     "msedge",
     "msedgewebview2",
     "opera",
-
     "discord",
     "spotify",
-
     "steam",
     "steamwebhelper",
     "gameoverlayui",
     "gameoverlayui64",
-
     "epicgameslauncher",
     "epicwebhelper",
-
     "nteglobal",
     "nteglobalgame",
     "nteglobalbrowser",
     "nteglobalwebbooster",
     "webbooster",
-
     "playnite",
     "playnite.fullscreenapp",
-
     "wallpaper32",
     "wallpaper64",
-
     "unitycrashhandler",
     "cefsharp.browsersubprocess",
-
     "ccff7r",
     "ccff7r-win64-shipping",
-
     "rebirth",
     "ff7rebirth_",
-
     "layoftheland",
     "layoftheland-win64-shipping",
-
     "midnightfightexpress",
-
     "shardpunk",
-
     "triangle_strategy",
     "triangle_strategy-win64-shipping",
-
     "titanfall2",
-
     "theepicproject",
     "theepicproject-win64-shipping",
-
     "pagodasteam-win64-shipping",
-
     "sb-win64-shipping",
-
     "discovery",
     "discovery-win64-shipping",
-
     "htgame",
     "htegame",
-
     "thefinals"
   ],
-
   "suspend_games": [
     "ccff7r",
     "rebirth",
@@ -95,41 +72,47 @@
     "layoftheland",
     "titanfall2"
   ],
-
   "instant_kill_games": [
     "nteglobal",
     "thefinals",
     "htgame",
     "htegame"
   ],
-
   "protected_processes": [
     "sunshine",
     "sunshinesvc",
-
     "parsecd",
     "parsec",
     "pservice",
-
     "tailscale",
     "tailscaled",
-
     "audiodg",
-
     "code",
     "codex",
-
     "windowsterminal",
     "openconsole",
-
     "pwsh",
     "powershell",
-
     "python",
-
     "explorer",
     "dwm",
     "winlogon",
     "csrss"
-  ]
+  ],
+  "stream_processes": [
+    "sunshine",
+    "moonlight",
+    "parsec",
+    "parsecd"
+  ],
+  "watchdog": {
+    "interval_seconds": 5,
+    "missing_stream_seconds": 20
+  },
+  "resource_monitor": {
+    "enabled": false,
+    "cpu_percent_threshold": 80,
+    "killable_processes": []
+  },
+  "api_rate_limit_seconds": 0.5
 }

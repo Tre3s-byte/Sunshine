@@ -1,4 +1,3 @@
 flask
 psutil
 requests
-waitress
