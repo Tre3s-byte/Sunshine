@@ -1,0 +1,47 @@
+Sun 05/10/2026 18:23:14.42 START 
+EXEC: C:\Python314\python.exe
+PYTHON EXEC: C:\Python314\python.exe
+PREFIX: C:\Python314
+ * Serving Flask app 'auditor-client'
+ * Debug mode: off
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:8765
+INFO:werkzeug:[33mPress CTRL+C to quit[0m
+^CSun 05/10/2026 18:23:42.32 START 
+EXEC: C:\Python314\python.exe
+PYTHON EXEC: C:\Python314\python.exe
+PREFIX: C:\Python314
+ * Serving Flask app 'auditor-client'
+ * Debug mode: off
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:8765
+INFO:werkzeug:[33mPress CTRL+C to quit[0m
+^CSun 05/10/2026 18:24:58.39 START 
+EXEC: C:\Python314\python.exe
+PYTHON EXEC: C:\Python314\python.exe
+PREFIX: C:\Python314
+ * Serving Flask app 'auditor-client'
+ * Debug mode: off
+INFO:werkzeug:[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:8765
+INFO:werkzeug:[33mPress CTRL+C to quit[0m
+^CSun 05/10/2026 18:27:16.21 START 
+EXEC: C:\Python314\python.exe
+Request failed: HTTPConnectionPool(host='127.0.0.1', port=8765): Max retries exceeded with url: /start (Caused by NewConnectionError("HTTPConnection(host='127.0.0.1', port=8765): Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it"))
+Exit code: 1 
+Sun 05/10/2026 18:27:42.65 START 
+EXEC: C:\Python314\python.exe
+Request failed: HTTPConnectionPool(host='127.0.0.1', port=8765): Max retries exceeded with url: /end (Caused by NewConnectionError("HTTPConnection(host='127.0.0.1', port=8765): Failed to establish a new connection: [WinError 10061] No connection could be made because the target machine actively refused it"))
+Exit code: 1 
+Sun 05/10/2026 18:27:52.64 START 
+EXEC: C:\Python314\python.exe
+START -> 200
+{"ok":true,"state":"STREAMING"}
+
+Exit code: 0 
+Sun 05/10/2026 18:28:10.31 START 
+EXEC: C:\Python314\python.exe
+END -> 200
+{"ok":true,"state":"POSSIBLE_DISCONNECT"}
+
+Exit code: 0 
