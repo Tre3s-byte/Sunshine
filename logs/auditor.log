@@ -6,3 +6,15 @@
  * Running on http://127.0.0.1:8765
  * Running on http://192.168.1.2:8765
 2026-05-10 18:23:39,135 [AUDITOR] [33mPress CTRL+C to quit[0m
+2026-05-10 18:27:48,588 [AUDITOR] Recovered state: STREAMING
+2026-05-10 18:27:48,590 [AUDITOR] Sunshine Auditor starting
+2026-05-10 18:27:48,606 [AUDITOR] [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:8765
+2026-05-10 18:27:48,613 [AUDITOR] [33mPress CTRL+C to quit[0m
+2026-05-10 18:27:52,930 [AUDITOR] EVENT stream_start | state=STREAMING gen=0
+2026-05-10 18:27:52,931 [AUDITOR] 127.0.0.1 - - [10/May/2026 18:27:52] "POST /start HTTP/1.1" 200 -
+2026-05-10 18:28:10,647 [AUDITOR] EVENT stream_end reason=end | state=STREAMING gen=0
+2026-05-10 18:28:10,647 [AUDITOR] STATE STREAMING -> POSSIBLE_DISCONNECT
+2026-05-10 18:28:10,649 [AUDITOR] 127.0.0.1 - - [10/May/2026 18:28:10] "POST /end HTTP/1.1" 200 -
+2026-05-10 18:28:18,655 [AUDITOR] False disconnect detected
+2026-05-10 18:28:18,656 [AUDITOR] STATE POSSIBLE_DISCONNECT -> STREAMING
