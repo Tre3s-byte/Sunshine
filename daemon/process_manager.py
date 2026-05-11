@@ -65,19 +65,27 @@ class ProcessManager:
         return bool(new_pids), new_pids
 
     def is_connection_active(self, ports: Iterable[int] | None = None) -> bool:
-        """Return True if there is at least one ESTABLISHED connection on the given ports.
+        """Return True if Sunshine has an active client connection.
 
-        Falls back to the default Sunshine streaming ports when *ports* is None.
-        Checks both local and remote address ports to cover outbound clients.
+        Checks both TCP (requires ESTABLISHED status) and UDP (requires a
+        remote address — indicates the socket is send-connected to a client).
+        Port 47984 is Sunshine's RTSP control channel which stays as a
+        persistent TCP ESTABLISHED connection for the entire session lifetime
+        and is the most reliable liveness indicator.
         """
         port_set = set(ports) if ports is not None else _SUNSHINE_STREAMING_PORTS
         try:
             for conn in psutil.net_connections(kind="inet"):
-                if conn.status != "ESTABLISHED":
-                    continue
                 lport = conn.laddr.port if conn.laddr else None
                 rport = conn.raddr.port if conn.raddr else None
-                if lport in port_set or rport in port_set:
+                if lport not in port_set and rport not in port_set:
+                    continue
+                # TCP: connection must be fully established
+                if conn.status == "ESTABLISHED":
+                    return True
+                # UDP: no status concept — a remote address means the socket is
+                # actively communicating with a specific peer
+                if conn.status in ("", "NONE") and conn.raddr:
                     return True
         except (psutil.Error, OSError) as exc:
             self.logger.warning("Connection check failed: %s", exc)
@@ -185,7 +193,11 @@ class ProcessManager:
         # Phase 1 — send WM_CLOSE to all simultaneously (non-blocking)
         for proc, _ in targets:
             try:
-                subprocess.Popen(["taskkill", "/PID", str(proc.pid), "/T"], capture_output=True)
+                subprocess.Popen(
+                    ["taskkill", "/PID", str(proc.pid), "/T"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             except (OSError, subprocess.SubprocessError):
                 pass
 
