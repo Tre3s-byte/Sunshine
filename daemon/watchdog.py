@@ -112,7 +112,7 @@ class StreamWatchdog:
                     continue
                 last_connection_check = now
 
-                if self.daemon.process_manager.is_connection_active(self.streaming_ports):
+                if self.daemon.process_manager.is_connection_active(self.streaming_ports, stream_pids=cached_stream_pids):
                     last_connected = now
                     if suspended_at is not None:
                         self.logger.info("Watchdog: connection restored — resuming games")
