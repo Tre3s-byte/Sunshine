@@ -15,8 +15,10 @@ import psutil
 from flask import Flask, jsonify, request
 
 from daemon.core import StateMachine
+from daemon.power_manager import PowerManager
 from daemon.process_manager import ProcessManager
 from daemon.resource_monitor import ResourceMonitor
+from daemon.session_tracker import SessionTracker
 from daemon.watchdog import StreamWatchdog
 
 
@@ -26,6 +28,7 @@ STATE_PATH = BASE_DIR / "state.json"
 LOG_DIR = BASE_DIR / "logs"
 DAEMON_LOG = LOG_DIR / "daemon.log"
 AUDIT_LOG = LOG_DIR / "audit.log"
+SESSION_LOG = LOG_DIR / "sessions.log"
 LOCK_FILE = BASE_DIR / "auditor.lock"
 HOST = "127.0.0.1"
 PORT = 8765
@@ -89,7 +92,10 @@ class SunshineDaemon:
         self.state_machine = StateMachine(STATE_PATH, logger)
         self.process_manager = ProcessManager(self.config, logger)
         self.resource_monitor = ResourceMonitor(self.config, logger)
+        self.power_manager = PowerManager(self.config, logger)
+        self.session_tracker = SessionTracker(SESSION_LOG, logger)
         self.timers: dict[str, threading.Timer] = {}
+        self.timer_deadlines: dict[str, float] = {}
         self.timer_lock = threading.RLock()
         self.last_api_call = 0.0
         self.watchdog = StreamWatchdog(self, logger)
@@ -125,10 +131,25 @@ class SunshineDaemon:
             for timer in self.timers.values():
                 timer.cancel()
             self.timers.clear()
+            self.timer_deadlines.clear()
+
+    def _schedule_timer(self, name: str, delay: int, fn, **kwargs) -> None:
+        timer = threading.Timer(delay, fn, kwargs=kwargs if kwargs else None)
+        timer.daemon = True
+        with self.timer_lock:
+            # Cancel any existing timer with this name
+            if name in self.timers:
+                self.timers[name].cancel()
+            self.timers[name] = timer
+            self.timer_deadlines[name] = time.time() + delay
+        timer.start()
 
     def start_stream(self) -> dict:
         self.cancel_timers()
         self.state_machine.transition("STARTING")
+        self.power_manager.set_profile("high_performance")
+        self.process_manager.launch_steam()
+        self.session_tracker.begin()
         self.audit("start")
         self.state_machine.transition("STREAMING")
         return self.state_machine.get()
@@ -143,12 +164,13 @@ class SunshineDaemon:
 
         if current_state == "STREAMING":
             self.state_machine.transition("POSSIBLE_DISCONNECT")
-            self.schedule_verify_disconnect()
+            self._schedule_verify_disconnect()
+            self._schedule_possible_disconnect_deadline()
         elif current_state == "GRACE_PERIOD":
-            self.schedule_cleanup()
+            self._schedule_cleanup()
         elif current_state in {"IDLE", "STARTING"}:
             self.state_machine.transition("GRACE_PERIOD")
-            self.schedule_cleanup()
+            self._schedule_cleanup()
 
         return self.state_machine.get()
 
@@ -158,16 +180,12 @@ class SunshineDaemon:
         self.state_machine.transition("STREAMING")
         return self.state_machine.get()
 
-    def schedule_verify_disconnect(self) -> None:
+    def _schedule_verify_disconnect(self) -> None:
         delay = int(self.config.get("timers", {}).get("disconnect_verify_seconds", 8))
-        timer = threading.Timer(delay, self.verify_disconnect)
-        timer.daemon = True
-        with self.timer_lock:
-            self.timers["disconnect_verify"] = timer
+        self._schedule_timer("disconnect_verify", delay, self._verify_disconnect)
         logger.info("Disconnect verification scheduled in %ss", delay)
-        timer.start()
 
-    def verify_disconnect(self) -> None:
+    def _verify_disconnect(self) -> None:
         if self.state_machine.get()["state"] != "POSSIBLE_DISCONNECT":
             return
 
@@ -177,23 +195,37 @@ class SunshineDaemon:
             return
 
         self.state_machine.transition("GRACE_PERIOD")
-        self.schedule_cleanup()
+        self._schedule_cleanup()
 
-    def schedule_cleanup(self) -> None:
+    def _schedule_possible_disconnect_deadline(self) -> None:
+        """Safety net: force out of POSSIBLE_DISCONNECT after a maximum wait."""
+        delay = int(self.config.get("timers", {}).get("possible_disconnect_max_seconds", 60))
+        self._schedule_timer("possible_disconnect_deadline", delay, self._possible_disconnect_expire)
+        logger.info("POSSIBLE_DISCONNECT deadline set at %ss", delay)
+
+    def _possible_disconnect_expire(self) -> None:
+        if self.state_machine.get()["state"] != "POSSIBLE_DISCONNECT":
+            return
+        logger.info("POSSIBLE_DISCONNECT deadline reached — advancing to GRACE_PERIOD")
+        self.state_machine.transition("GRACE_PERIOD")
+        self._schedule_cleanup()
+
+    def _schedule_cleanup(self) -> None:
         self.cancel_timers()
         delay = int(self.config.get("timers", {}).get("cleanup_seconds", 1800))
-        timer = threading.Timer(delay, self.cleanup, kwargs={"reason": "grace_period_expired"})
-        timer.daemon = True
-        with self.timer_lock:
-            self.timers["cleanup"] = timer
+        self._schedule_timer("cleanup", delay, self.cleanup, reason="grace_period_expired")
         logger.info("Cleanup scheduled in %ss", delay)
-        timer.start()
 
     def cleanup(self, reason: str) -> dict:
         self.cancel_timers()
         self.state_machine.transition("CLEANING")
         terminated_processes = self.process_manager.kill_cleanup_processes()
         high_cpu_processes = self.resource_monitor.kill_high_cpu_processes()
+        self.session_tracker.end(
+            reason=reason,
+            terminated_processes=terminated_processes + high_cpu_processes,
+        )
+        self.power_manager.set_profile("balanced")
         self.audit(
             "cleanup",
             reason=reason,
@@ -202,6 +234,25 @@ class SunshineDaemon:
         )
         self.state_machine.transition("IDLE")
         return self.state_machine.get()
+
+    def get_status(self) -> dict:
+        state = self.state_machine.get()
+        now = time.time()
+
+        timers = {}
+        with self.timer_lock:
+            for name, deadline in self.timer_deadlines.items():
+                timers[name] = max(0, int(deadline - now))
+
+        session_start = self.session_tracker.start_time
+        result = {
+            **state,
+            "timers_remaining_seconds": timers,
+            "session_start": int(session_start) if session_start else None,
+            "session_duration_seconds": int(now - session_start) if session_start else None,
+            "connection_active": self.process_manager.is_connection_active(),
+        }
+        return result
 
 
 daemon = SunshineDaemon()
@@ -244,6 +295,11 @@ def state_route():
 @app.route("/health", methods=["GET"])
 def health_route():
     return jsonify({"ok": True, **daemon.state_machine.get()})
+
+
+@app.route("/status", methods=["GET"])
+def status_route():
+    return jsonify({"ok": True, **daemon.get_status()})
 
 
 def main() -> None:
