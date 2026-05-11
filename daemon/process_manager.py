@@ -67,36 +67,35 @@ class ProcessManager:
     def is_connection_active(self, ports: Iterable[int] | None = None, stream_pids: set[int] | None = None) -> bool:
         """Return True if Sunshine has an active client connection.
 
-        Primary check (when stream_pids is provided): inspects the actual
-        socket table of known stream processes. This works correctly through
-        VPNs (e.g. Tailscale/WireGuard) because it queries the process's own
-        connections rather than filtering the system-wide table by port — the
-        port-based filter misses tunnelled traffic.
+        Only TCP ESTABLISHED connections are considered. UDP sockets are
+        excluded because Sunshine keeps them bound with a cached raddr after
+        the client disconnects, which causes false positives.
 
-        Fallback (port-based): used when no PIDs are cached yet. Checks both
-        TCP (ESTABLISHED) and UDP (raddr present) on the configured ports.
+        Primary check (when stream_pids is provided): inspects the TCP socket
+        table of known stream processes. Works through VPNs (Tailscale/
+        WireGuard) because it queries by process rather than filtering by port.
+
+        Fallback (port-based): used when no PIDs are cached yet.
         """
         try:
             if stream_pids:
-                for conn in psutil.net_connections(kind="inet"):
+                for conn in psutil.net_connections(kind="tcp"):
                     if conn.pid not in stream_pids:
+                        continue
+                    if conn.status != "ESTABLISHED":
                         continue
                     if not conn.raddr:
                         continue
-                    if conn.status == "ESTABLISHED" or conn.status in ("", "NONE"):
-                        return True
+                    return True
                 return False
 
             # Fallback: port-based scan (no PID info available yet)
             port_set = set(ports) if ports is not None else _SUNSHINE_STREAMING_PORTS
-            for conn in psutil.net_connections(kind="inet"):
+            for conn in psutil.net_connections(kind="tcp"):
                 lport = conn.laddr.port if conn.laddr else None
-                rport = conn.raddr.port if conn.raddr else None
-                if lport not in port_set and rport not in port_set:
+                if lport not in port_set:
                     continue
-                if conn.status == "ESTABLISHED":
-                    return True
-                if conn.status in ("", "NONE") and conn.raddr:
+                if conn.status == "ESTABLISHED" and conn.raddr:
                     return True
         except (psutil.Error, OSError) as exc:
             self.logger.warning("Connection check failed: %s", exc)
