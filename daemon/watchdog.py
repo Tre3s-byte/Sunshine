@@ -59,95 +59,97 @@ class StreamWatchdog:
         cached_stream_pids: set[int] = set()
 
         while True:
-            time.sleep(self.interval_seconds)
-            state = self.daemon.state_machine.get()["state"]
+            try:
+                time.sleep(self.interval_seconds)
+                state = self.daemon.state_machine.get()["state"]
 
-            if state != "STREAMING":
+                if state != "STREAMING":
+                    prev_state = state
+                    continue
+
+                # Reset all counters on re-entry into STREAMING (e.g. after reconnect())
+                if prev_state != "STREAMING":
+                    now = time.time()
+                    last_seen = now
+                    last_connection_check = now
+                    last_connected = now
+                    cached_stream_pids = set()
+
+                    if self.connection_check_enabled and suspended_at is not None:
+                        resumed = self.daemon.process_manager.resume_games()
+                        if resumed:
+                            self.daemon.audit("connection_restored", resumed=resumed, reason="restream")
+                        suspended_at = None
+
+                    self.logger.info("Watchdog: entered STREAMING, all counters reset")
                 prev_state = state
-                continue
 
-            # Reset all counters on re-entry into STREAMING (e.g. after reconnect())
-            if prev_state != "STREAMING":
+                # ------------------------------------------------------------------
+                # Process check — uses cached PIDs to avoid full process enumeration
+                # on every tick (reduces anti-cheat interference in sensitive games)
+                # ------------------------------------------------------------------
+                is_alive, cached_stream_pids = self.daemon.process_manager.is_stream_alive_cached(
+                    cached_stream_pids
+                )
+                if is_alive:
+                    last_seen = time.time()
+                elif time.time() - last_seen > self.missing_stream_seconds:
+                    self.logger.info(
+                        "Watchdog: stream process absent for >%ss — triggering disconnect",
+                        self.missing_stream_seconds,
+                    )
+                    self.daemon.handle_disconnect(reason="watchdog_process_gone")
+                    continue
+
+                # ------------------------------------------------------------------
+                # Connection check — runs every check_interval_seconds (10 min)
+                # ------------------------------------------------------------------
+                if not self.connection_check_enabled:
+                    continue
+
                 now = time.time()
-                last_seen = now
+                if now - last_connection_check < self.check_interval_seconds:
+                    continue
                 last_connection_check = now
-                last_connected = now
-                cached_stream_pids = set()
 
-                if self.connection_check_enabled and suspended_at is not None:
-                    resumed = self.daemon.process_manager.resume_games()
-                    if resumed:
-                        self.daemon.audit("connection_restored", resumed=resumed, reason="restream")
-                    suspended_at = None
-
-                self.logger.info("Watchdog: entered STREAMING, all counters reset")
-            prev_state = state
-
-            # ------------------------------------------------------------------
-            # Process check — uses cached PIDs to avoid full process enumeration
-            # on every tick (reduces anti-cheat interference in sensitive games)
-            # ------------------------------------------------------------------
-            is_alive, cached_stream_pids = self.daemon.process_manager.is_stream_alive_cached(
-                cached_stream_pids
-            )
-            if is_alive:
-                last_seen = time.time()
-            elif time.time() - last_seen > self.missing_stream_seconds:
-                self.logger.info(
-                    "Watchdog: stream process absent for >%ss — triggering disconnect",
-                    self.missing_stream_seconds,
-                )
-                self.daemon.handle_disconnect(reason="watchdog_process_gone")
-                continue
-
-            # ------------------------------------------------------------------
-            # Connection check — runs every check_interval_seconds (10 min)
-            # ------------------------------------------------------------------
-            if not self.connection_check_enabled:
-                continue
-
-            now = time.time()
-            if now - last_connection_check < self.check_interval_seconds:
-                continue
-            last_connection_check = now
-
-            if self.daemon.process_manager.is_connection_active(self.streaming_ports):
-                last_connected = now
-                if suspended_at is not None:
-                    self.logger.info("Watchdog: connection restored — resuming games")
-                    resumed = self.daemon.process_manager.resume_games()
-                    self.daemon.audit("connection_restored", resumed=resumed)
-                    suspended_at = None
-            else:
-                elapsed_since_connected = now - last_connected
-                self.logger.info(
-                    "Watchdog: no active connection on ports %s (%.0fs since last seen)",
-                    self.streaming_ports,
-                    elapsed_since_connected,
-                )
-
-                if suspended_at is None:
-                    # First failed check — suspend games to free RAM/GPU
-                    self.logger.info("Watchdog: suspending games after connection loss")
-                    affected = self.daemon.process_manager.suspend_games()
-                    self.daemon.audit("games_suspended", reason="connection_lost", processes=affected)
-                    suspended_at = now
-
-                elif now - suspended_at > self.kill_after_seconds:
-                    # Kill deadline reached — full cleanup
-                    self.logger.info(
-                        "Watchdog: no connection for >%ss since suspension — killing processes",
-                        self.kill_after_seconds,
-                    )
-                    self.daemon.audit(
-                        "connection_timeout_kill",
-                        suspended_for_seconds=int(now - suspended_at),
-                    )
-                    self.daemon.cleanup(reason="connection_timeout")
-                    suspended_at = None
+                if self.daemon.process_manager.is_connection_active(self.streaming_ports):
+                    last_connected = now
+                    if suspended_at is not None:
+                        self.logger.info("Watchdog: connection restored — resuming games")
+                        resumed = self.daemon.process_manager.resume_games()
+                        self.daemon.audit("connection_restored", resumed=resumed)
+                        suspended_at = None
                 else:
-                    remaining = self.kill_after_seconds - (now - suspended_at)
+                    elapsed_since_connected = now - last_connected
                     self.logger.info(
-                        "Watchdog: games still suspended, %.0fs until kill deadline",
-                        remaining,
+                        "Watchdog: no active connection on ports %s (%.0fs since last seen)",
+                        self.streaming_ports,
+                        elapsed_since_connected,
                     )
+
+                    if suspended_at is None:
+                        self.logger.info("Watchdog: suspending games after connection loss")
+                        affected = self.daemon.process_manager.suspend_games()
+                        self.daemon.audit("games_suspended", reason="connection_lost", processes=affected)
+                        suspended_at = now
+
+                    elif now - suspended_at > self.kill_after_seconds:
+                        self.logger.info(
+                            "Watchdog: no connection for >%ss since suspension — killing processes",
+                            self.kill_after_seconds,
+                        )
+                        self.daemon.audit(
+                            "connection_timeout_kill",
+                            suspended_for_seconds=int(now - suspended_at),
+                        )
+                        self.daemon.cleanup(reason="connection_timeout")
+                        suspended_at = None
+                    else:
+                        remaining = self.kill_after_seconds - (now - suspended_at)
+                        self.logger.info(
+                            "Watchdog: games still suspended, %.0fs until kill deadline",
+                            remaining,
+                        )
+
+            except Exception as exc:
+                self.logger.warning("Watchdog tick error (will retry next interval): %s", exc, exc_info=True)

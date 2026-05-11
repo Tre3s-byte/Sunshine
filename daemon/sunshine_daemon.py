@@ -2,6 +2,7 @@ import atexit
 import json
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -13,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import psutil
 from flask import Flask, jsonify, request
+from waitress import serve
 
 from daemon.core import StateMachine
 from daemon.power_manager import PowerManager
@@ -34,16 +36,30 @@ HOST = "127.0.0.1"
 PORT = 8765
 
 
+class _JsonFormatter(logging.Formatter):
+    """Writes each log record as a single JSON line to daemon.log."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        data: dict = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "lvl": record.levelname,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            data["exc"] = self.formatException(record.exc_info)
+        return json.dumps(data, ensure_ascii=False)
+
+
 def setup_logging() -> logging.Logger:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [DAEMON] %(message)s",
-        handlers=[
-            logging.FileHandler(DAEMON_LOG, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
+
+    file_handler = logging.FileHandler(DAEMON_LOG, encoding="utf-8")
+    file_handler.setFormatter(_JsonFormatter())
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter("%(asctime)s [DAEMON] %(message)s"))
+
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
     return logging.getLogger("sunshine-daemon")
 
 
@@ -98,8 +114,18 @@ class SunshineDaemon:
         self.timer_deadlines: dict[str, float] = {}
         self.timer_lock = threading.RLock()
         self.last_api_call = 0.0
+        self._rate_lock = threading.Lock()
         self.watchdog = StreamWatchdog(self, logger)
         self.watchdog.start()
+
+        # Startup recovery: if state persisted as STREAMING but no stream
+        # process is alive, don't wait for the first watchdog tick — act now.
+        if self.state_machine.get()["state"] == "STREAMING":
+            if not self.process_manager.is_stream_alive():
+                logger.info("Startup: stale STREAMING state with no stream process — transitioning immediately")
+                self.state_machine.transition("POSSIBLE_DISCONNECT")
+                self._schedule_verify_disconnect()
+                self._schedule_possible_disconnect_deadline()
 
     def verify_token(self) -> bool:
         expected = self.config.get("api_token")
@@ -108,11 +134,12 @@ class SunshineDaemon:
         return request.headers.get("X-API-Token") == expected
 
     def rate_limit_ok(self) -> bool:
-        now = time.time()
-        if now - self.last_api_call < float(self.config.get("api_rate_limit_seconds", 0.5)):
-            return False
-        self.last_api_call = now
-        return True
+        with self._rate_lock:
+            now = time.time()
+            if now - self.last_api_call < float(self.config.get("api_rate_limit_seconds", 0.5)):
+                return False
+            self.last_api_call = now
+            return True
 
     def audit(self, event: str, **details) -> None:
         AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -137,7 +164,6 @@ class SunshineDaemon:
         timer = threading.Timer(delay, fn, kwargs=kwargs if kwargs else None)
         timer.daemon = True
         with self.timer_lock:
-            # Cancel any existing timer with this name
             if name in self.timers:
                 self.timers[name].cancel()
             self.timers[name] = timer
@@ -183,6 +209,23 @@ class SunshineDaemon:
         self.state_machine.transition("STREAMING")
         return self.state_machine.get()
 
+    def reload_config(self) -> dict:
+        new_cfg = load_config()
+        self.config.clear()
+        self.config.update(new_cfg)
+        # Re-apply watchdog settings that are cached at init time
+        watchdog_cfg = new_cfg.get("watchdog", {})
+        conn_cfg = new_cfg.get("connection_check", {})
+        self.watchdog.interval_seconds = int(watchdog_cfg.get("interval_seconds", 5))
+        self.watchdog.missing_stream_seconds = int(watchdog_cfg.get("missing_stream_seconds", 20))
+        self.watchdog.connection_check_enabled = bool(conn_cfg.get("enabled", False))
+        self.watchdog.streaming_ports = set(int(p) for p in conn_cfg.get("ports", [47998, 48010]))
+        self.watchdog.check_interval_seconds = int(conn_cfg.get("check_interval_seconds", 600))
+        self.watchdog.kill_after_seconds = int(conn_cfg.get("kill_after_seconds", 1200))
+        self.power_manager._profiles = new_cfg.get("power_profiles", {})
+        logger.info("Config reloaded from %s", CONFIG_PATH)
+        return {"reloaded": True}
+
     def _schedule_verify_disconnect(self) -> None:
         delay = int(self.config.get("timers", {}).get("disconnect_verify_seconds", 8))
         self._schedule_timer("disconnect_verify", delay, self._verify_disconnect)
@@ -201,7 +244,6 @@ class SunshineDaemon:
         self._schedule_cleanup()
 
     def _schedule_possible_disconnect_deadline(self) -> None:
-        """Safety net: force out of POSSIBLE_DISCONNECT after a maximum wait."""
         delay = int(self.config.get("timers", {}).get("possible_disconnect_max_seconds", 60))
         self._schedule_timer("possible_disconnect_deadline", delay, self._possible_disconnect_expire)
         logger.info("POSSIBLE_DISCONNECT deadline set at %ss", delay)
@@ -252,14 +294,13 @@ class SunshineDaemon:
                 timers[name] = max(0, int(deadline - now))
 
         session_start = self.session_tracker.start_time
-        result = {
+        return {
             **state,
             "timers_remaining_seconds": timers,
             "session_start": int(session_start) if session_start else None,
             "session_duration_seconds": int(now - session_start) if session_start else None,
             "connection_active": self.process_manager.is_connection_active(),
         }
-        return result
 
 
 daemon = SunshineDaemon()
@@ -309,11 +350,34 @@ def status_route():
     return jsonify({"ok": True, **daemon.get_status()})
 
 
+@app.route("/reload", methods=["POST"])
+def reload_route():
+    return guarded(daemon.reload_config)
+
+
+def _handle_shutdown(signum, _frame) -> None:
+    logger.info("Shutdown signal %s received — cleaning up", signum)
+    try:
+        state = daemon.state_machine.get()["state"]
+        if state not in {"IDLE", "CLEANING"}:
+            daemon.state_machine.transition("IDLE")
+    except Exception:
+        pass
+    release_lock()
+    sys.exit(0)
+
+
 def main() -> None:
     acquire_lock()
     atexit.register(release_lock)
+
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _handle_shutdown)
+
     logger.info("Sunshine daemon starting on %s:%s", HOST, PORT)
-    app.run(host=HOST, port=PORT, threaded=True, use_reloader=False)
+    serve(app, host=HOST, port=PORT, threads=4, channel_timeout=30)
 
 
 if __name__ == "__main__":
