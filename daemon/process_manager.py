@@ -1,5 +1,6 @@
 import logging
 import subprocess
+import time
 from collections.abc import Iterable
 
 import psutil
@@ -133,60 +134,58 @@ class ProcessManager:
 
         return resumed
 
-    def _graceful_terminate(self, proc: psutil.Process, wait_seconds: int) -> None:
-        """Send WM_CLOSE via taskkill, then force-kill if the process outlives the grace period."""
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T"],
-                capture_output=True, timeout=5,
-            )
-            proc.wait(timeout=wait_seconds)
-        except psutil.TimeoutExpired:
-            self.logger.info(
-                "Process pid=%s did not exit gracefully, force-killing", proc.pid
-            )
-            try:
-                proc.kill()
-            except (psutil.Error, OSError):
-                pass
-        except (psutil.NoSuchProcess, OSError, subprocess.SubprocessError):
-            pass
-
     def kill_cleanup_processes(self) -> list[str]:
-        cleanup_processes = {
-            self.normalize(name) for name in self.config.get("cleanup_processes", [])
-        }
-        protected_processes = {
-            self.normalize(name) for name in self.config.get("protected_processes", [])
-        }
-        grace_seconds = int(self.config.get("graceful_kill_wait_seconds", 5))
-        terminated = []
+        cleanup_set = {self.normalize(n) for n in self.config.get("cleanup_processes", [])}
+        protected_set = {self.normalize(n) for n in self.config.get("protected_processes", [])}
+        grace_seconds = int(self.config.get("graceful_kill_wait_seconds", 3))
 
-        if not cleanup_processes:
+        if not cleanup_set:
             self.logger.info("No cleanup_processes configured")
-            return terminated
+            return []
 
+        # Collect targets, resuming any that were suspended
+        targets: list[tuple[psutil.Process, str]] = []
         for proc in psutil.process_iter(["pid", "name", "status"]):
             try:
-                process_name = self.normalize(proc.info.get("name"))
-                if process_name not in cleanup_processes:
+                name = self.normalize(proc.info.get("name"))
+                if name not in cleanup_set or name in protected_set:
                     continue
-                if process_name in protected_processes:
-                    self.logger.info("Skipping protected process: %s", process_name)
-                    continue
-
-                # Resume first so the close signal reaches the main thread
                 if proc.info.get("status") == psutil.STATUS_STOPPED:
                     proc.resume()
+                targets.append((proc, name))
+            except (psutil.Error, OSError):
+                continue
 
-                self._graceful_terminate(proc, wait_seconds=grace_seconds)
-                terminated.append(f"{process_name}:{proc.info.get('pid')}")
-                self.logger.info(
-                    "Terminated cleanup process: %s pid=%s", process_name, proc.info.get("pid")
-                )
-            except (psutil.Error, OSError) as exc:
-                self.logger.warning(
-                    "Could not terminate process pid=%s: %s", proc.info.get("pid"), exc
-                )
+        if not targets:
+            return []
+
+        # Phase 1 — send WM_CLOSE to all simultaneously (non-blocking)
+        for proc, _ in targets:
+            try:
+                subprocess.Popen(["taskkill", "/PID", str(proc.pid), "/T"], capture_output=True)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        # Phase 2 — wait for all within a single shared grace window
+        deadline = time.time() + grace_seconds
+        for proc, _ in targets:
+            remaining = max(0.0, deadline - time.time())
+            try:
+                proc.wait(timeout=remaining)
+            except (psutil.TimeoutExpired, psutil.NoSuchProcess):
+                pass
+
+        # Phase 3 — force-kill survivors, record everything
+        terminated = []
+        for proc, name in targets:
+            pid = proc.pid
+            try:
+                if proc.is_running():
+                    proc.kill()
+                    self.logger.info("Force-killed: %s pid=%s", name, pid)
+            except (psutil.NoSuchProcess, OSError):
+                pass
+            terminated.append(f"{name}:{pid}")
+            self.logger.info("Terminated cleanup process: %s pid=%s", name, pid)
 
         return terminated
