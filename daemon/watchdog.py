@@ -56,6 +56,7 @@ class StreamWatchdog:
         last_connected = time.time()
         suspended_at: float | None = None
         prev_state: str | None = None
+        cached_stream_pids: set[int] = set()
 
         while True:
             time.sleep(self.interval_seconds)
@@ -71,6 +72,7 @@ class StreamWatchdog:
                 last_seen = now
                 last_connection_check = now
                 last_connected = now
+                cached_stream_pids = set()
 
                 if self.connection_check_enabled and suspended_at is not None:
                     resumed = self.daemon.process_manager.resume_games()
@@ -82,9 +84,13 @@ class StreamWatchdog:
             prev_state = state
 
             # ------------------------------------------------------------------
-            # Process check — runs every interval
+            # Process check — uses cached PIDs to avoid full process enumeration
+            # on every tick (reduces anti-cheat interference in sensitive games)
             # ------------------------------------------------------------------
-            if self.daemon.process_manager.is_stream_alive():
+            is_alive, cached_stream_pids = self.daemon.process_manager.is_stream_alive_cached(
+                cached_stream_pids
+            )
+            if is_alive:
                 last_seen = time.time()
             elif time.time() - last_seen > self.missing_stream_seconds:
                 self.logger.info(

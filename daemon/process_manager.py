@@ -41,6 +41,29 @@ class ProcessManager:
         )
         return bool(self.find_by_patterns(stream_processes))
 
+    def is_stream_alive_cached(self, cached_pids: set[int]) -> tuple[bool, set[int]]:
+        """Check stream liveness without a full process scan on the hot path.
+
+        Fast path: verify cached PIDs with psutil.pid_exists() — O(1) per PID,
+        no process enumeration, safe for anti-cheat environments.
+
+        Slow path (full scan): only triggered when every cached PID is gone,
+        meaning the previous stream process actually died. Returns fresh PIDs
+        so the next call stays on the fast path.
+        """
+        if cached_pids:
+            alive = {pid for pid in cached_pids if psutil.pid_exists(pid)}
+            if alive:
+                return True, alive
+
+        # Full scan only when cache is cold or all cached PIDs are dead
+        stream_processes = self.config.get(
+            "stream_processes", ["sunshine", "moonlight", "parsec", "parsecd"]
+        )
+        found = self.find_by_patterns(stream_processes)
+        new_pids = {proc.pid for proc in found}
+        return bool(new_pids), new_pids
+
     def is_connection_active(self, ports: Iterable[int] | None = None) -> bool:
         """Return True if there is at least one ESTABLISHED connection on the given ports.
 
