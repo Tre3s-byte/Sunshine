@@ -112,7 +112,8 @@
   "connection_check": {
     "enabled": true,
     "ports": [47998, 48010],
-    "missing_connection_seconds": 30
+    "check_interval_seconds": 600,
+    "kill_after_seconds": 1200
   },
   "resource_monitor": {
     "enabled": false,

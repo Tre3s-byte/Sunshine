@@ -58,6 +58,60 @@ class ProcessManager:
             self.logger.warning("Connection check failed: %s", exc)
         return False
 
+    def suspend_games(self) -> list[str]:
+        """Freeze processes listed in suspend_games, freeing CPU/GPU cycles without losing state.
+
+        instant_kill_games are hard-killed immediately since they cannot be safely suspended
+        (e.g. anti-cheat titles that detect suspension as tampering).
+        """
+        suspend_targets = {self.normalize(n) for n in self.config.get("suspend_games", [])}
+        instant_kill_targets = {self.normalize(n) for n in self.config.get("instant_kill_games", [])}
+        protected = {self.normalize(n) for n in self.config.get("protected_processes", [])}
+        affected = []
+
+        for proc in psutil.process_iter(["pid", "name", "status"]):
+            try:
+                name = self.normalize(proc.info.get("name"))
+                if name in protected:
+                    continue
+
+                if name in instant_kill_targets:
+                    proc.kill()
+                    affected.append(f"killed:{name}:{proc.info.get('pid')}")
+                    self.logger.info("Instant-killed game: %s pid=%s", name, proc.info.get("pid"))
+
+                elif name in suspend_targets:
+                    if proc.info.get("status") == psutil.STATUS_STOPPED:
+                        continue
+                    proc.suspend()
+                    affected.append(f"suspended:{name}:{proc.info.get('pid')}")
+                    self.logger.info("Suspended game: %s pid=%s", name, proc.info.get("pid"))
+
+            except (psutil.Error, OSError) as exc:
+                self.logger.warning("Could not act on pid=%s: %s", proc.info.get("pid"), exc)
+
+        return affected
+
+    def resume_games(self) -> list[str]:
+        """Resume previously suspended game processes."""
+        suspend_targets = {self.normalize(n) for n in self.config.get("suspend_games", [])}
+        resumed = []
+
+        for proc in psutil.process_iter(["pid", "name", "status"]):
+            try:
+                name = self.normalize(proc.info.get("name"))
+                if name not in suspend_targets:
+                    continue
+                if proc.info.get("status") != psutil.STATUS_STOPPED:
+                    continue
+                proc.resume()
+                resumed.append(f"{name}:{proc.info.get('pid')}")
+                self.logger.info("Resumed game: %s pid=%s", name, proc.info.get("pid"))
+            except (psutil.Error, OSError) as exc:
+                self.logger.warning("Could not resume pid=%s: %s", proc.info.get("pid"), exc)
+
+        return resumed
+
     def kill_cleanup_processes(self) -> list[str]:
         cleanup_processes = {
             self.normalize(name) for name in self.config.get("cleanup_processes", [])
@@ -71,7 +125,7 @@ class ProcessManager:
             self.logger.info("No cleanup_processes configured")
             return terminated
 
-        for proc in psutil.process_iter(["pid", "name"]):
+        for proc in psutil.process_iter(["pid", "name", "status"]):
             try:
                 process_name = self.normalize(proc.info.get("name"))
                 if process_name not in cleanup_processes:
@@ -79,6 +133,10 @@ class ProcessManager:
                 if process_name in protected_processes:
                     self.logger.info("Skipping protected process: %s", process_name)
                     continue
+
+                # Resume first so terminate() is not sent to a stopped process
+                if proc.info.get("status") == psutil.STATUS_STOPPED:
+                    proc.resume()
 
                 proc.terminate()
                 terminated.append(f"{process_name}:{proc.info.get('pid')}")
