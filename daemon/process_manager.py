@@ -1,4 +1,5 @@
 import logging
+import subprocess
 from collections.abc import Iterable
 
 import psutil
@@ -58,6 +59,26 @@ class ProcessManager:
             self.logger.warning("Connection check failed: %s", exc)
         return False
 
+    def launch_steam(self) -> bool:
+        """Start Steam if it is not already running."""
+        steam_cfg = self.config.get("steam", {})
+        path = steam_cfg.get("path")
+        if not path:
+            return False
+
+        if self.find_by_patterns(["steam"]):
+            self.logger.info("Steam already running, skipping launch")
+            return True
+
+        args = steam_cfg.get("args", [])
+        try:
+            subprocess.Popen([path] + args)
+            self.logger.info("Launched Steam: %s %s", path, args)
+            return True
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.logger.warning("Could not launch Steam: %s", exc)
+            return False
+
     def suspend_games(self) -> list[str]:
         """Freeze processes listed in suspend_games, freeing CPU/GPU cycles without losing state.
 
@@ -112,6 +133,25 @@ class ProcessManager:
 
         return resumed
 
+    def _graceful_terminate(self, proc: psutil.Process, wait_seconds: int) -> None:
+        """Send WM_CLOSE via taskkill, then force-kill if the process outlives the grace period."""
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T"],
+                capture_output=True, timeout=5,
+            )
+            proc.wait(timeout=wait_seconds)
+        except psutil.TimeoutExpired:
+            self.logger.info(
+                "Process pid=%s did not exit gracefully, force-killing", proc.pid
+            )
+            try:
+                proc.kill()
+            except (psutil.Error, OSError):
+                pass
+        except (psutil.NoSuchProcess, OSError, subprocess.SubprocessError):
+            pass
+
     def kill_cleanup_processes(self) -> list[str]:
         cleanup_processes = {
             self.normalize(name) for name in self.config.get("cleanup_processes", [])
@@ -119,6 +159,7 @@ class ProcessManager:
         protected_processes = {
             self.normalize(name) for name in self.config.get("protected_processes", [])
         }
+        grace_seconds = int(self.config.get("graceful_kill_wait_seconds", 5))
         terminated = []
 
         if not cleanup_processes:
@@ -134,14 +175,18 @@ class ProcessManager:
                     self.logger.info("Skipping protected process: %s", process_name)
                     continue
 
-                # Resume first so terminate() is not sent to a stopped process
+                # Resume first so the close signal reaches the main thread
                 if proc.info.get("status") == psutil.STATUS_STOPPED:
                     proc.resume()
 
-                proc.terminate()
+                self._graceful_terminate(proc, wait_seconds=grace_seconds)
                 terminated.append(f"{process_name}:{proc.info.get('pid')}")
-                self.logger.info("Terminated cleanup process: %s pid=%s", process_name, proc.info.get("pid"))
+                self.logger.info(
+                    "Terminated cleanup process: %s pid=%s", process_name, proc.info.get("pid")
+                )
             except (psutil.Error, OSError) as exc:
-                self.logger.warning("Could not terminate process pid=%s: %s", proc.info.get("pid"), exc)
+                self.logger.warning(
+                    "Could not terminate process pid=%s: %s", proc.info.get("pid"), exc
+                )
 
         return terminated

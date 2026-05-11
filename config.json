@@ -2,8 +2,10 @@
   "game_root": "C:/Games/RestrictedApps",
   "timers": {
     "cleanup_seconds": 1800,
-    "disconnect_verify_seconds": 8
+    "disconnect_verify_seconds": 8,
+    "possible_disconnect_max_seconds": 60
   },
+  "graceful_kill_wait_seconds": 5,
   "power_profiles": {
     "high_performance": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
     "balanced": "381b4222-f694-41f0-9685-ff5bb260df2e",
