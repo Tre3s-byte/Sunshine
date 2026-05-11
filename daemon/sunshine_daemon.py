@@ -155,8 +155,11 @@ class SunshineDaemon:
         return self.state_machine.get()
 
     def end_stream(self) -> dict:
+        self.cancel_timers()
+        self.state_machine.transition("CLEANING")
         self.audit("end")
-        return self.cleanup(reason="end")
+        threading.Thread(target=self._do_cleanup_work, kwargs={"reason": "end"}, daemon=True).start()
+        return self.state_machine.get()
 
     def handle_disconnect(self, reason: str = "disconnect") -> dict:
         current_state = self.state_machine.get()["state"]
@@ -217,8 +220,13 @@ class SunshineDaemon:
         logger.info("Cleanup scheduled in %ss", delay)
 
     def cleanup(self, reason: str) -> dict:
+        """Synchronous cleanup — safe to call from background threads (watchdog, timers)."""
         self.cancel_timers()
         self.state_machine.transition("CLEANING")
+        self._do_cleanup_work(reason)
+        return self.state_machine.get()
+
+    def _do_cleanup_work(self, reason: str) -> None:
         terminated_processes = self.process_manager.kill_cleanup_processes()
         high_cpu_processes = self.resource_monitor.kill_high_cpu_processes()
         self.session_tracker.end(
@@ -233,7 +241,6 @@ class SunshineDaemon:
             high_cpu_processes=high_cpu_processes,
         )
         self.state_machine.transition("IDLE")
-        return self.state_machine.get()
 
     def get_status(self) -> dict:
         state = self.state_machine.get()
