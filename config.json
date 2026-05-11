@@ -109,6 +109,11 @@
     "interval_seconds": 5,
     "missing_stream_seconds": 20
   },
+  "connection_check": {
+    "enabled": true,
+    "ports": [47998, 48010],
+    "missing_connection_seconds": 30
+  },
   "resource_monitor": {
     "enabled": false,
     "cpu_percent_threshold": 80,

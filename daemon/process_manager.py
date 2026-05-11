@@ -4,6 +4,9 @@ from collections.abc import Iterable
 import psutil
 
 
+_SUNSHINE_STREAMING_PORTS = {47998, 48010}
+
+
 class ProcessManager:
     """Process lookup and cleanup helpers used only by the daemon."""
 
@@ -35,6 +38,25 @@ class ProcessManager:
             "stream_processes", ["sunshine", "moonlight", "parsec", "parsecd"]
         )
         return bool(self.find_by_patterns(stream_processes))
+
+    def is_connection_active(self, ports: Iterable[int] | None = None) -> bool:
+        """Return True if there is at least one ESTABLISHED connection on the given ports.
+
+        Falls back to the default Sunshine streaming ports when *ports* is None.
+        Checks both local and remote address ports to cover outbound clients.
+        """
+        port_set = set(ports) if ports is not None else _SUNSHINE_STREAMING_PORTS
+        try:
+            for conn in psutil.net_connections(kind="inet"):
+                if conn.status != "ESTABLISHED":
+                    continue
+                lport = conn.laddr.port if conn.laddr else None
+                rport = conn.raddr.port if conn.raddr else None
+                if lport in port_set or rport in port_set:
+                    return True
+        except (psutil.Error, OSError) as exc:
+            self.logger.warning("Connection check failed: %s", exc)
+        return False
 
     def kill_cleanup_processes(self) -> list[str]:
         cleanup_processes = {
