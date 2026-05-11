@@ -64,27 +64,38 @@ class ProcessManager:
         new_pids = {proc.pid for proc in found}
         return bool(new_pids), new_pids
 
-    def is_connection_active(self, ports: Iterable[int] | None = None) -> bool:
+    def is_connection_active(self, ports: Iterable[int] | None = None, stream_pids: set[int] | None = None) -> bool:
         """Return True if Sunshine has an active client connection.
 
-        Checks both TCP (requires ESTABLISHED status) and UDP (requires a
-        remote address — indicates the socket is send-connected to a client).
-        Port 47984 is Sunshine's RTSP control channel which stays as a
-        persistent TCP ESTABLISHED connection for the entire session lifetime
-        and is the most reliable liveness indicator.
+        Primary check (when stream_pids is provided): inspects the actual
+        socket table of known stream processes. This works correctly through
+        VPNs (e.g. Tailscale/WireGuard) because it queries the process's own
+        connections rather than filtering the system-wide table by port — the
+        port-based filter misses tunnelled traffic.
+
+        Fallback (port-based): used when no PIDs are cached yet. Checks both
+        TCP (ESTABLISHED) and UDP (raddr present) on the configured ports.
         """
-        port_set = set(ports) if ports is not None else _SUNSHINE_STREAMING_PORTS
         try:
+            if stream_pids:
+                for conn in psutil.net_connections(kind="inet"):
+                    if conn.pid not in stream_pids:
+                        continue
+                    if not conn.raddr:
+                        continue
+                    if conn.status == "ESTABLISHED" or conn.status in ("", "NONE"):
+                        return True
+                return False
+
+            # Fallback: port-based scan (no PID info available yet)
+            port_set = set(ports) if ports is not None else _SUNSHINE_STREAMING_PORTS
             for conn in psutil.net_connections(kind="inet"):
                 lport = conn.laddr.port if conn.laddr else None
                 rport = conn.raddr.port if conn.raddr else None
                 if lport not in port_set and rport not in port_set:
                     continue
-                # TCP: connection must be fully established
                 if conn.status == "ESTABLISHED":
                     return True
-                # UDP: no status concept — a remote address means the socket is
-                # actively communicating with a specific peer
                 if conn.status in ("", "NONE") and conn.raddr:
                     return True
         except (psutil.Error, OSError) as exc:
