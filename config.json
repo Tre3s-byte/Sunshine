@@ -1,7 +1,8 @@
 {
   "game_root": "C:/Games/RestrictedApps",
   "timers": {
-    "cleanup_seconds": 1800,
+    "suspend_seconds": 1200,
+    "cleanup_seconds": 3600,
     "disconnect_verify_seconds": 8,
     "possible_disconnect_max_seconds": 60
   },
@@ -115,7 +116,7 @@
     "enabled": true,
     "ports": [47984, 47998, 47999, 48000, 48010],
     "check_interval_seconds": 600,
-    "kill_after_seconds": 1200
+    "kill_after_seconds": 3600
   },
   "resource_monitor": {
     "enabled": false,

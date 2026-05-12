@@ -190,6 +190,11 @@ class SunshineDaemon:
         self.cancel_timers()
         self.state_machine.transition("STARTING")
         self.power_manager.set_profile("high_performance")
+        # Resume any games that were suspended by a previous tier-1 timer so the
+        # user finds them ready instead of frozen on reconnect.
+        resumed = self.process_manager.resume_games()
+        if resumed:
+            self.audit("games_resumed", reason="reconnect", processes=resumed)
         self.process_manager.launch_steam()
         self.session_tracker.begin()
         self.audit("start")
@@ -223,6 +228,9 @@ class SunshineDaemon:
 
     def reconnect(self) -> dict:
         self.cancel_timers()
+        resumed = self.process_manager.resume_games()
+        if resumed:
+            self.audit("games_resumed", reason="reconnect", processes=resumed)
         self.audit("reconnect")
         self.state_machine.transition("STREAMING")
         return self.state_machine.get()
@@ -275,9 +283,26 @@ class SunshineDaemon:
 
     def _schedule_cleanup(self) -> None:
         self.cancel_timers()
-        delay = int(self.config.get("timers", {}).get("cleanup_seconds", 1800))
-        self._schedule_timer("cleanup", delay, self.cleanup, reason="grace_period_expired")
-        logger.info("Cleanup scheduled in %ss", delay)
+        timers_cfg = self.config.get("timers", {})
+        cleanup_delay = int(timers_cfg.get("cleanup_seconds", 3600))
+        suspend_delay = int(timers_cfg.get("suspend_seconds", 1200))
+
+        # Tier 1: suspend games to free GPU/RAM while preserving game state in memory
+        if 0 < suspend_delay < cleanup_delay:
+            self._schedule_timer("suspend", suspend_delay, self._suspend_games_tier1)
+            logger.info("Suspend tier-1 scheduled in %ss", suspend_delay)
+
+        # Tier 2: full cleanup — kill everything
+        self._schedule_timer("cleanup", cleanup_delay, self.cleanup, reason="grace_period_expired")
+        logger.info("Cleanup scheduled in %ss", cleanup_delay)
+
+    def _suspend_games_tier1(self) -> None:
+        """Tier-1 timer fired: suspend games to free GPU/RAM while preserving state."""
+        if self.state_machine.get()["state"] != "GRACE_PERIOD":
+            return
+        affected = self.process_manager.suspend_games()
+        self.audit("games_suspended", reason="grace_tier1", processes=affected)
+        logger.info("Tier-1 suspend applied: %s", affected)
 
     def cleanup(self, reason: str) -> dict:
         """Synchronous cleanup — safe to call from background threads (watchdog, timers)."""
