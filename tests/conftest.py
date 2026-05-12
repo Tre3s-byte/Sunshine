@@ -45,7 +45,7 @@ def base_config() -> dict:
         "stream_processes": ["sunshine", "moonlight"],
         "watchdog": {"interval_seconds": 5, "missing_stream_seconds": 20},
         "connection_check": {
-            "enabled": True,
+            "enabled": False,
             "ports": [47998, 48010],
             "check_interval_seconds": 600,
             "kill_after_seconds": 3600,
