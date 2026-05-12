@@ -120,14 +120,28 @@ class SunshineDaemon:
         self.watchdog = StreamWatchdog(self, logger)
         self.watchdog.start()
 
-        # Startup recovery: if state persisted as STREAMING but no stream
-        # process is alive, don't wait for the first watchdog tick — act now.
-        if self.state_machine.get()["state"] == "STREAMING":
+        # Startup recovery: restore timers lost across daemon restarts.
+        recovered_state = self.state_machine.get()["state"]
+        if recovered_state == "STREAMING":
             if not self.process_manager.is_stream_alive():
                 logger.info("Startup: stale STREAMING state with no stream process — transitioning immediately")
                 self.state_machine.transition("POSSIBLE_DISCONNECT")
                 self._schedule_verify_disconnect()
                 self._schedule_possible_disconnect_deadline()
+        elif recovered_state == "POSSIBLE_DISCONNECT":
+            logger.info("Startup: recovered POSSIBLE_DISCONNECT — advancing to GRACE_PERIOD")
+            self.state_machine.transition("GRACE_PERIOD")
+            self._schedule_cleanup()
+        elif recovered_state == "GRACE_PERIOD":
+            logger.info("Startup: recovered GRACE_PERIOD — re-scheduling cleanup timer")
+            self._schedule_cleanup()
+        elif recovered_state == "CLEANING":
+            logger.info("Startup: recovered CLEANING state — re-running cleanup")
+            threading.Thread(
+                target=self._do_cleanup_work,
+                kwargs={"reason": "startup_recovery"},
+                daemon=True,
+            ).start()
 
     def verify_token(self) -> bool:
         expected = self.config.get("api_token")
@@ -198,7 +212,9 @@ class SunshineDaemon:
             self._schedule_verify_disconnect()
             self._schedule_possible_disconnect_deadline()
         elif current_state == "GRACE_PERIOD":
-            self._schedule_cleanup()
+            # Cleanup timer is already counting down; a redundant disconnect
+            # event must not reset it or processes would never be cleaned up.
+            logger.info("Disconnect received in GRACE_PERIOD — cleanup timer already running, ignoring")
         elif current_state in {"IDLE", "STARTING"}:
             self.state_machine.transition("GRACE_PERIOD")
             self._schedule_cleanup()
@@ -271,20 +287,24 @@ class SunshineDaemon:
         return self.state_machine.get()
 
     def _do_cleanup_work(self, reason: str) -> None:
-        terminated_processes = self.process_manager.kill_cleanup_processes()
-        high_cpu_processes = self.resource_monitor.kill_high_cpu_processes()
-        self.session_tracker.end(
-            reason=reason,
-            terminated_processes=terminated_processes + high_cpu_processes,
-        )
-        self.power_manager.set_profile("balanced")
-        self.audit(
-            "cleanup",
-            reason=reason,
-            terminated_processes=terminated_processes,
-            high_cpu_processes=high_cpu_processes,
-        )
-        self.state_machine.transition("IDLE")
+        try:
+            terminated_processes = self.process_manager.kill_cleanup_processes()
+            high_cpu_processes = self.resource_monitor.kill_high_cpu_processes()
+            self.session_tracker.end(
+                reason=reason,
+                terminated_processes=terminated_processes + high_cpu_processes,
+            )
+            self.power_manager.set_profile("balanced")
+            self.audit(
+                "cleanup",
+                reason=reason,
+                terminated_processes=terminated_processes,
+                high_cpu_processes=high_cpu_processes,
+            )
+        except Exception:
+            logger.exception("Unexpected error during cleanup (reason=%s)", reason)
+        finally:
+            self.state_machine.transition("IDLE")
 
     def get_status(self) -> dict:
         state = self.state_machine.get()
