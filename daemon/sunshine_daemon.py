@@ -17,6 +17,7 @@ from flask import Flask, jsonify, request
 from waitress import serve
 
 from daemon.core import StateMachine
+from daemon.metrics import MetricsTracker
 from daemon.power_manager import PowerManager
 from daemon.process_manager import ProcessManager
 from daemon.resource_monitor import ResourceMonitor
@@ -105,8 +106,9 @@ def release_lock() -> None:
 class SunshineDaemon:
     def __init__(self):
         self.config = load_config()
+        self.metrics = MetricsTracker()
         self.state_machine = StateMachine(STATE_PATH, logger)
-        self.process_manager = ProcessManager(self.config, logger)
+        self.process_manager = ProcessManager(self.config, logger, metrics=self.metrics)
         self.resource_monitor = ResourceMonitor(self.config, logger)
         self.power_manager = PowerManager(self.config, logger)
         self.session_tracker = SessionTracker(SESSION_LOG, logger)
@@ -306,6 +308,90 @@ class SunshineDaemon:
 daemon = SunshineDaemon()
 
 
+_DASHBOARD_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Sunshine Daemon Metrics</title>
+<style>
+body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0d1117;color:#c9d1d9;margin:20px;}
+h1{color:#58a6ff;font-size:18px;}
+table{border-collapse:collapse;width:100%;margin-top:10px;}
+th,td{padding:6px 12px;text-align:right;border-bottom:1px solid #30363d;}
+th{background:#161b22;color:#8b949e;text-align:left;}
+td:first-child,th:first-child{text-align:left;color:#58a6ff;}
+.warn{color:#f85149;font-weight:bold;}
+.ok{color:#3fb950;}
+.controls{margin:10px 0;}
+input,select{background:#161b22;color:#c9d1d9;border:1px solid #30363d;padding:4px 8px;}
+.spike{background:#3d1a1a;}
+</style></head>
+<body>
+<h1>Sunshine Daemon Metrics</h1>
+<div class="controls">
+  Window: <select id="window">
+    <option value="60">1 min</option>
+    <option value="300" selected>5 min</option>
+    <option value="900">15 min</option>
+    <option value="3600">1 hour</option>
+  </select>
+  Refresh: <select id="refresh">
+    <option value="2000" selected>2s</option>
+    <option value="5000">5s</option>
+    <option value="10000">10s</option>
+  </select>
+  <span id="updated" style="color:#8b949e;margin-left:20px;"></span>
+</div>
+<table id="stats">
+  <thead><tr><th>Operation</th><th>Count</th><th>Avg ms</th><th>P50 ms</th><th>P99 ms</th><th>Max ms</th></tr></thead>
+  <tbody></tbody>
+</table>
+<h1 style="margin-top:30px;">Recent spikes (>20ms)</h1>
+<table id="spikes">
+  <thead><tr><th>Time</th><th>Operation</th><th>Duration ms</th><th>Details</th></tr></thead>
+  <tbody></tbody>
+</table>
+<script>
+let timer = null;
+async function refresh() {
+  const w = document.getElementById('window').value;
+  const r1 = await fetch('/metrics?window=' + w).then(r => r.json());
+  const r2 = await fetch('/metrics/recent?window=' + w + '&limit=200').then(r => r.json());
+  renderStats(r1.stats);
+  renderSpikes(r2.samples);
+  document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+function renderStats(stats) {
+  const tbody = document.querySelector('#stats tbody');
+  tbody.innerHTML = '';
+  const ops = Object.keys(stats).sort((a, b) => stats[b].max_ms - stats[a].max_ms);
+  for (const op of ops) {
+    const s = stats[op];
+    const cls = s.max_ms > 50 ? 'warn' : (s.max_ms > 20 ? '' : 'ok');
+    tbody.insertAdjacentHTML('beforeend',
+      `<tr><td>${op}</td><td>${s.count}</td><td>${s.avg_ms}</td><td>${s.p50_ms}</td><td class="${cls}">${s.p99_ms}</td><td class="${cls}">${s.max_ms}</td></tr>`);
+  }
+}
+function renderSpikes(samples) {
+  const tbody = document.querySelector('#spikes tbody');
+  tbody.innerHTML = '';
+  const spikes = samples.filter(s => s.ms > 20).reverse().slice(0, 50);
+  for (const s of spikes) {
+    const t = new Date(s.ts * 1000).toLocaleTimeString();
+    const d = s.d ? JSON.stringify(s.d) : '';
+    tbody.insertAdjacentHTML('beforeend',
+      `<tr class="spike"><td>${t}</td><td>${s.op}</td><td>${s.ms}</td><td>${d}</td></tr>`);
+  }
+}
+function schedule() {
+  if (timer) clearInterval(timer);
+  timer = setInterval(refresh, parseInt(document.getElementById('refresh').value));
+}
+document.getElementById('window').addEventListener('change', refresh);
+document.getElementById('refresh').addEventListener('change', schedule);
+refresh(); schedule();
+</script>
+</body></html>
+"""
+
+
 def guarded(handler):
     if not daemon.rate_limit_ok():
         return jsonify({"ok": False, "error": "rate-limited"}), 429
@@ -348,6 +434,30 @@ def health_route():
 @app.route("/status", methods=["GET"])
 def status_route():
     return jsonify({"ok": True, **daemon.get_status()})
+
+
+@app.route("/metrics", methods=["GET"])
+def metrics_route():
+    window = int(request.args.get("window", 300))
+    return jsonify({"ok": True, "window_seconds": window, "stats": daemon.metrics.stats(window)})
+
+
+@app.route("/metrics/recent", methods=["GET"])
+def metrics_recent_route():
+    window = int(request.args.get("window", 300))
+    op = request.args.get("op")
+    limit = int(request.args.get("limit", 500))
+    return jsonify({
+        "ok": True,
+        "window_seconds": window,
+        "op": op,
+        "samples": daemon.metrics.recent(window, op=op, limit=limit),
+    })
+
+
+@app.route("/metrics/dashboard", methods=["GET"])
+def metrics_dashboard_route():
+    return (_DASHBOARD_HTML, 200, {"Content-Type": "text/html; charset=utf-8"})
 
 
 @app.route("/reload", methods=["POST"])

@@ -1,20 +1,80 @@
+import contextlib
+import ctypes
 import logging
+import platform
 import subprocess
 import time
 from collections.abc import Iterable
 
 import psutil
 
+from daemon.metrics import MetricsTracker
+
 
 _SUNSHINE_STREAMING_PORTS = {47998, 48010}
+_IS_WINDOWS = platform.system() == "Windows"
+
+
+if _IS_WINDOWS:
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _ERROR_ACCESS_DENIED = 5
+    _STILL_ACTIVE = 259
+
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+
+    def _pid_alive(pid: int) -> bool:
+        """Check PID liveness via Win32 OpenProcess + GetExitCodeProcess.
+
+        Single Win32 call per PID — no EnumProcesses, no Toolhelp32 snapshot,
+        no system-wide process table walk. This is the lightest possible
+        liveness check on Windows and avoids the kernel hooks that
+        anti-cheat systems (NTE, EAC, BattlEye) flag as suspicious.
+
+        Returns True if the process is running. ACCESS_DENIED means the
+        process exists but our token can't open it (e.g. another user's
+        process or a protected process), still counts as alive.
+        """
+        if pid <= 0:
+            return False
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+        try:
+            exit_code = wintypes.DWORD()
+            if _kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return exit_code.value == _STILL_ACTIVE
+            return True
+        finally:
+            _kernel32.CloseHandle(handle)
+else:
+    def _pid_alive(pid: int) -> bool:
+        return psutil.pid_exists(pid)
+
+
+@contextlib.contextmanager
+def _maybe_time(metrics: MetricsTracker | None, op: str, **details):
+    if metrics is None:
+        yield
+    else:
+        with metrics.time_call(op, **details):
+            yield
 
 
 class ProcessManager:
     """Process lookup and cleanup helpers used only by the daemon."""
 
-    def __init__(self, config: dict, logger: logging.Logger):
+    def __init__(self, config: dict, logger: logging.Logger, metrics: MetricsTracker | None = None):
         self.config = config
         self.logger = logger
+        self.metrics = metrics
 
     @staticmethod
     def normalize(name: str | None) -> str:
@@ -25,13 +85,14 @@ class ProcessManager:
         normalized_patterns = [self.normalize(pattern) for pattern in patterns]
         matches = []
 
-        for proc in psutil.process_iter(["pid", "name"]):
-            try:
-                process_name = self.normalize(proc.info.get("name"))
-                if any(pattern in process_name for pattern in normalized_patterns):
-                    matches.append(proc)
-            except (psutil.Error, OSError):
-                continue
+        with _maybe_time(self.metrics, "process_iter", caller="find_by_patterns"):
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    process_name = self.normalize(proc.info.get("name"))
+                    if any(pattern in process_name for pattern in normalized_patterns):
+                        matches.append(proc)
+                except (psutil.Error, OSError):
+                    continue
 
         return matches
 
@@ -44,15 +105,18 @@ class ProcessManager:
     def is_stream_alive_cached(self, cached_pids: set[int]) -> tuple[bool, set[int]]:
         """Check stream liveness without a full process scan on the hot path.
 
-        Fast path: verify cached PIDs with psutil.pid_exists() — O(1) per PID,
-        no process enumeration, safe for anti-cheat environments.
+        Fast path: verify cached PIDs via Win32 OpenProcess — single syscall
+        per PID, no EnumProcesses, no Toolhelp32 snapshot. This is the
+        anti-cheat-safe replacement for psutil.pid_exists() (which on some
+        psutil/Windows builds enumerates the full process table).
 
         Slow path (full scan): only triggered when every cached PID is gone,
         meaning the previous stream process actually died. Returns fresh PIDs
         so the next call stays on the fast path.
         """
         if cached_pids:
-            alive = {pid for pid in cached_pids if psutil.pid_exists(pid)}
+            with _maybe_time(self.metrics, "pid_alive_cached", n=len(cached_pids)):
+                alive = {pid for pid in cached_pids if _pid_alive(pid)}
             if alive:
                 return True, alive
 
@@ -78,8 +142,11 @@ class ProcessManager:
         Fallback (port-based): used when no PIDs are cached yet.
         """
         try:
+            with _maybe_time(self.metrics, "net_connections", scoped=bool(stream_pids)):
+                conns = psutil.net_connections(kind="tcp")
+
             if stream_pids:
-                for conn in psutil.net_connections(kind="tcp"):
+                for conn in conns:
                     if conn.pid not in stream_pids:
                         continue
                     if conn.status != "ESTABLISHED":
@@ -91,7 +158,7 @@ class ProcessManager:
 
             # Fallback: port-based scan (no PID info available yet)
             port_set = set(ports) if ports is not None else _SUNSHINE_STREAMING_PORTS
-            for conn in psutil.net_connections(kind="tcp"):
+            for conn in conns:
                 lport = conn.laddr.port if conn.laddr else None
                 if lport not in port_set:
                     continue
@@ -132,7 +199,10 @@ class ProcessManager:
         protected = {self.normalize(n) for n in self.config.get("protected_processes", [])}
         affected = []
 
-        for proc in psutil.process_iter(["pid", "name", "status"]):
+        with _maybe_time(self.metrics, "process_iter", caller="suspend_games"):
+            iterator = list(psutil.process_iter(["pid", "name", "status"]))
+
+        for proc in iterator:
             try:
                 name = self.normalize(proc.info.get("name"))
                 if name in protected:
@@ -160,7 +230,10 @@ class ProcessManager:
         suspend_targets = {self.normalize(n) for n in self.config.get("suspend_games", [])}
         resumed = []
 
-        for proc in psutil.process_iter(["pid", "name", "status"]):
+        with _maybe_time(self.metrics, "process_iter", caller="resume_games"):
+            iterator = list(psutil.process_iter(["pid", "name", "status"]))
+
+        for proc in iterator:
             try:
                 name = self.normalize(proc.info.get("name"))
                 if name not in suspend_targets:
@@ -186,7 +259,10 @@ class ProcessManager:
 
         # Collect targets, resuming any that were suspended
         targets: list[tuple[psutil.Process, str]] = []
-        for proc in psutil.process_iter(["pid", "name", "status"]):
+        with _maybe_time(self.metrics, "process_iter", caller="kill_cleanup"):
+            iterator = list(psutil.process_iter(["pid", "name", "status"]))
+
+        for proc in iterator:
             try:
                 name = self.normalize(proc.info.get("name"))
                 if name not in cleanup_set or name in protected_set:
