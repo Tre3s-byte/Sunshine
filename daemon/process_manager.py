@@ -136,14 +136,18 @@ class ProcessManager:
         the client disconnects, which causes false positives.
 
         Primary check (when stream_pids is provided): inspects the TCP socket
-        table of known stream processes. Works through VPNs (Tailscale/
-        WireGuard) because it queries by process rather than filtering by port.
+        table of known stream processes, filtered to streaming ports. The local
+        port (laddr) is always the Sunshine streaming port regardless of VPN
+        tunneling (Tailscale/WireGuard), so port filtering is safe here and
+        prevents false positives from Sunshine's web UI or other connections.
 
         Fallback (port-based): used when no PIDs are cached yet.
         """
         try:
             with _maybe_time(self.metrics, "net_connections", scoped=bool(stream_pids)):
                 conns = psutil.net_connections(kind="tcp")
+
+            port_set = set(ports) if ports is not None else _SUNSHINE_STREAMING_PORTS
 
             if stream_pids:
                 for conn in conns:
@@ -153,11 +157,14 @@ class ProcessManager:
                         continue
                     if not conn.raddr:
                         continue
+                    # Filter by local streaming port to exclude Sunshine's web UI
+                    # and other non-streaming connections that would be false positives.
+                    if conn.laddr and conn.laddr.port not in port_set:
+                        continue
                     return True
                 return False
 
             # Fallback: port-based scan (no PID info available yet)
-            port_set = set(ports) if ports is not None else _SUNSHINE_STREAMING_PORTS
             for conn in conns:
                 lport = conn.laddr.port if conn.laddr else None
                 if lport not in port_set:

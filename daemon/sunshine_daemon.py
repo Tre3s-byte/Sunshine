@@ -120,14 +120,28 @@ class SunshineDaemon:
         self.watchdog = StreamWatchdog(self, logger)
         self.watchdog.start()
 
-        # Startup recovery: if state persisted as STREAMING but no stream
-        # process is alive, don't wait for the first watchdog tick — act now.
-        if self.state_machine.get()["state"] == "STREAMING":
+        # Startup recovery: restore timers lost across daemon restarts.
+        recovered_state = self.state_machine.get()["state"]
+        if recovered_state == "STREAMING":
             if not self.process_manager.is_stream_alive():
                 logger.info("Startup: stale STREAMING state with no stream process — transitioning immediately")
                 self.state_machine.transition("POSSIBLE_DISCONNECT")
                 self._schedule_verify_disconnect()
                 self._schedule_possible_disconnect_deadline()
+        elif recovered_state == "POSSIBLE_DISCONNECT":
+            logger.info("Startup: recovered POSSIBLE_DISCONNECT — advancing to GRACE_PERIOD")
+            self.state_machine.transition("GRACE_PERIOD")
+            self._schedule_cleanup()
+        elif recovered_state == "GRACE_PERIOD":
+            logger.info("Startup: recovered GRACE_PERIOD — re-scheduling cleanup timer")
+            self._schedule_cleanup()
+        elif recovered_state == "CLEANING":
+            logger.info("Startup: recovered CLEANING state — re-running cleanup")
+            threading.Thread(
+                target=self._do_cleanup_work,
+                kwargs={"reason": "startup_recovery"},
+                daemon=True,
+            ).start()
 
     def verify_token(self) -> bool:
         expected = self.config.get("api_token")
@@ -176,6 +190,11 @@ class SunshineDaemon:
         self.cancel_timers()
         self.state_machine.transition("STARTING")
         self.power_manager.set_profile("high_performance")
+        # Resume any games that were suspended by a previous tier-1 timer so the
+        # user finds them ready instead of frozen on reconnect.
+        resumed = self.process_manager.resume_games()
+        if resumed:
+            self.audit("games_resumed", reason="reconnect", processes=resumed)
         self.process_manager.launch_steam()
         self.session_tracker.begin()
         self.audit("start")
@@ -198,7 +217,9 @@ class SunshineDaemon:
             self._schedule_verify_disconnect()
             self._schedule_possible_disconnect_deadline()
         elif current_state == "GRACE_PERIOD":
-            self._schedule_cleanup()
+            # Cleanup timer is already counting down; a redundant disconnect
+            # event must not reset it or processes would never be cleaned up.
+            logger.info("Disconnect received in GRACE_PERIOD — cleanup timer already running, ignoring")
         elif current_state in {"IDLE", "STARTING"}:
             self.state_machine.transition("GRACE_PERIOD")
             self._schedule_cleanup()
@@ -207,6 +228,9 @@ class SunshineDaemon:
 
     def reconnect(self) -> dict:
         self.cancel_timers()
+        resumed = self.process_manager.resume_games()
+        if resumed:
+            self.audit("games_resumed", reason="reconnect", processes=resumed)
         self.audit("reconnect")
         self.state_machine.transition("STREAMING")
         return self.state_machine.get()
@@ -223,7 +247,7 @@ class SunshineDaemon:
         self.watchdog.connection_check_enabled = bool(conn_cfg.get("enabled", False))
         self.watchdog.streaming_ports = set(int(p) for p in conn_cfg.get("ports", [47998, 48010]))
         self.watchdog.check_interval_seconds = int(conn_cfg.get("check_interval_seconds", 600))
-        self.watchdog.kill_after_seconds = int(conn_cfg.get("kill_after_seconds", 1200))
+        self.watchdog.kill_after_seconds = int(conn_cfg.get("kill_after_seconds", 3600))
         self.power_manager._profiles = new_cfg.get("power_profiles", {})
         logger.info("Config reloaded from %s", CONFIG_PATH)
         return {"reloaded": True}
@@ -259,9 +283,26 @@ class SunshineDaemon:
 
     def _schedule_cleanup(self) -> None:
         self.cancel_timers()
-        delay = int(self.config.get("timers", {}).get("cleanup_seconds", 1800))
-        self._schedule_timer("cleanup", delay, self.cleanup, reason="grace_period_expired")
-        logger.info("Cleanup scheduled in %ss", delay)
+        timers_cfg = self.config.get("timers", {})
+        cleanup_delay = int(timers_cfg.get("cleanup_seconds", 3600))
+        suspend_delay = int(timers_cfg.get("suspend_seconds", 1200))
+
+        # Tier 1: suspend games to free GPU/RAM while preserving game state in memory
+        if 0 < suspend_delay < cleanup_delay:
+            self._schedule_timer("suspend", suspend_delay, self._suspend_games_tier1)
+            logger.info("Suspend tier-1 scheduled in %ss", suspend_delay)
+
+        # Tier 2: full cleanup — kill everything
+        self._schedule_timer("cleanup", cleanup_delay, self.cleanup, reason="grace_period_expired")
+        logger.info("Cleanup scheduled in %ss", cleanup_delay)
+
+    def _suspend_games_tier1(self) -> None:
+        """Tier-1 timer fired: suspend games to free GPU/RAM while preserving state."""
+        if self.state_machine.get()["state"] != "GRACE_PERIOD":
+            return
+        affected = self.process_manager.suspend_games()
+        self.audit("games_suspended", reason="grace_tier1", processes=affected)
+        logger.info("Tier-1 suspend applied: %s", affected)
 
     def cleanup(self, reason: str) -> dict:
         """Synchronous cleanup — safe to call from background threads (watchdog, timers)."""
@@ -271,20 +312,24 @@ class SunshineDaemon:
         return self.state_machine.get()
 
     def _do_cleanup_work(self, reason: str) -> None:
-        terminated_processes = self.process_manager.kill_cleanup_processes()
-        high_cpu_processes = self.resource_monitor.kill_high_cpu_processes()
-        self.session_tracker.end(
-            reason=reason,
-            terminated_processes=terminated_processes + high_cpu_processes,
-        )
-        self.power_manager.set_profile("balanced")
-        self.audit(
-            "cleanup",
-            reason=reason,
-            terminated_processes=terminated_processes,
-            high_cpu_processes=high_cpu_processes,
-        )
-        self.state_machine.transition("IDLE")
+        try:
+            terminated_processes = self.process_manager.kill_cleanup_processes()
+            high_cpu_processes = self.resource_monitor.kill_high_cpu_processes()
+            self.session_tracker.end(
+                reason=reason,
+                terminated_processes=terminated_processes + high_cpu_processes,
+            )
+            self.power_manager.set_profile("balanced")
+            self.audit(
+                "cleanup",
+                reason=reason,
+                terminated_processes=terminated_processes,
+                high_cpu_processes=high_cpu_processes,
+            )
+        except Exception:
+            logger.exception("Unexpected error during cleanup (reason=%s)", reason)
+        finally:
+            self.state_machine.transition("IDLE")
 
     def get_status(self) -> dict:
         state = self.state_machine.get()
