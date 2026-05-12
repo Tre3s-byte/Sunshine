@@ -247,7 +247,7 @@ class SunshineDaemon:
         self.watchdog.connection_check_enabled = bool(conn_cfg.get("enabled", False))
         self.watchdog.streaming_ports = set(int(p) for p in conn_cfg.get("ports", [47998, 48010]))
         self.watchdog.check_interval_seconds = int(conn_cfg.get("check_interval_seconds", 600))
-        self.watchdog.kill_after_seconds = int(conn_cfg.get("kill_after_seconds", 1200))
+        self.watchdog.kill_after_seconds = int(conn_cfg.get("kill_after_seconds", 3600))
         self.power_manager._profiles = new_cfg.get("power_profiles", {})
         logger.info("Config reloaded from %s", CONFIG_PATH)
         return {"reloaded": True}

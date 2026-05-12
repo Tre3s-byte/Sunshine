@@ -43,7 +43,7 @@ class StreamWatchdog:
         self.connection_check_enabled = bool(conn_cfg.get("enabled", False))
         self.streaming_ports = set(int(p) for p in conn_cfg.get("ports", [47998, 48010]))
         self.check_interval_seconds = int(conn_cfg.get("check_interval_seconds", 600))
-        self.kill_after_seconds = int(conn_cfg.get("kill_after_seconds", 1200))
+        self.kill_after_seconds = int(conn_cfg.get("kill_after_seconds", 3600))
 
         self.thread = threading.Thread(target=self.run, daemon=True, name="stream-watchdog")
 
