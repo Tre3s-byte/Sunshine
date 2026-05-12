@@ -113,7 +113,7 @@
     "missing_stream_seconds": 20
   },
   "connection_check": {
-    "enabled": true,
+    "enabled": false,
     "ports": [47984, 47998, 47999, 48000, 48010],
     "check_interval_seconds": 600,
     "kill_after_seconds": 3600
