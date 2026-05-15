@@ -25,6 +25,7 @@ class StateMachine:
         self.lock = threading.RLock()
         self.generation = 0
         self.state = "IDLE"
+        self.state_entered_at = int(time.time())
         self.restore()
 
     def get(self) -> dict:
@@ -33,6 +34,7 @@ class StateMachine:
                 "generation": self.generation,
                 "state": self.state,
                 "timestamp": int(time.time()),
+                "state_entered_at": self.state_entered_at,
             }
 
     def transition(self, new_state: str) -> str:
@@ -45,6 +47,7 @@ class StateMachine:
                 return self.state
 
             self.state = new_state
+            self.state_entered_at = int(time.time())
             self.generation += 1
             self.logger.info("STATE %s -> %s", old_state, new_state)
             self.save_locked()
@@ -55,6 +58,7 @@ class StateMachine:
             "generation": self.generation,
             "state": self.state,
             "timestamp": int(time.time()),
+            "state_entered_at": self.state_entered_at,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
@@ -73,10 +77,16 @@ class StateMachine:
 
             with self.lock:
                 self.state = state
+                # Older state files only have timestamp; use it as the best
+                # available state-entry time so grace-period cleanup deadlines
+                # survive daemon restarts instead of restarting from scratch.
+                entered_at = data.get("state_entered_at", data.get("timestamp"))
+                self.state_entered_at = int(entered_at or time.time())
                 self.generation = int(data.get("generation", 0))
                 self.logger.info("Recovered state: %s", self.state)
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             with self.lock:
                 self.state = "IDLE"
+                self.state_entered_at = int(time.time())
                 self.generation = 0
                 self.logger.warning("Could not restore state; defaulting to IDLE")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -259,8 +260,14 @@ class TestStartupRecovery:
 
     def test_recovery_grace_period_reschedules_cleanup(self, daemon_module, tmp_path):
         # Pre-seed state.json as GRACE_PERIOD before daemon construction
+        now = int(time.time())
         daemon_module.STATE_PATH.write_text(json.dumps(
-            {"state": "GRACE_PERIOD", "generation": 5, "timestamp": 0}
+            {
+                "state": "GRACE_PERIOD",
+                "generation": 5,
+                "timestamp": now,
+                "state_entered_at": now,
+            }
         ))
 
         d = daemon_module.SunshineDaemon()
@@ -272,6 +279,25 @@ class TestStartupRecovery:
         assert d.state_machine.get()["state"] == "GRACE_PERIOD"
         assert "cleanup" in d.timers, "cleanup timer must be re-scheduled on restart"
         assert "suspend" in d.timers, "suspend timer must be re-scheduled on restart"
+
+    def test_recovery_grace_period_preserves_original_cleanup_deadline(self, daemon_module):
+        """Regression: restart must not give a dropped session a fresh hour."""
+        grace_started_at = int(time.time()) - 600
+        daemon_module.STATE_PATH.write_text(json.dumps(
+            {
+                "state": "GRACE_PERIOD",
+                "generation": 5,
+                "timestamp": grace_started_at,
+                "state_entered_at": grace_started_at,
+            }
+        ))
+
+        d = daemon_module.SunshineDaemon()
+
+        assert d.state_machine.get()["state"] == "GRACE_PERIOD"
+        assert "cleanup" in d.timers
+        assert 2900 <= d.timer_deadlines["cleanup"] - time.time() <= 3000
+        assert 500 <= d.timer_deadlines["suspend"] - time.time() <= 600
 
     def test_recovery_possible_disconnect_advances_to_grace(
         self, daemon_module
