@@ -97,31 +97,31 @@ def _fire(daemon, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 class TestScenarioS1_CleanDisconnect:
-    """Caso típico: phone Moonlight cierra → detach-cmd → /disconnect."""
+    """Caso típico: phone Moonlight cierra → detach-cmd → /disconnect.
+
+    Sunshine's detach-cmd is authoritative; we go directly to GRACE_PERIOD.
+    There is no verification step because is_stream_alive() always returns
+    True (sunshine.exe runs as a service).
+    """
 
     def test_full_path_to_kill(self, daemon):
         # 1. Estábamos streameando
         daemon.start_stream()
         assert daemon.state_machine.get()["state"] == "STREAMING"
 
-        # 2. detach-cmd dispara /disconnect (cierre del cliente)
-        daemon.process_manager.is_stream_alive.return_value = False
+        # 2. detach-cmd dispara /disconnect → directo a GRACE_PERIOD
         daemon.handle_disconnect(reason="detach_cmd")
-        assert daemon.state_machine.get()["state"] == "POSSIBLE_DISCONNECT"
-
-        # 3. Verify confirma desconexión real → entra a GRACE_PERIOD
-        _fire(daemon, "disconnect_verify")
         assert daemon.state_machine.get()["state"] == "GRACE_PERIOD"
         assert "suspend" in daemon.timers
         assert "cleanup" in daemon.timers
 
-        # 4. A los 20 min: tier-1 suspende
+        # 3. A los 20 min: tier-1 suspende
         _fire(daemon, "suspend")
         daemon.process_manager.suspend_games.assert_called_once()
         # GRACE_PERIOD se mantiene (no transiciona)
         assert daemon.state_machine.get()["state"] == "GRACE_PERIOD"
 
-        # 5. A los 60 min: tier-2 mata todo
+        # 4. A los 60 min: tier-2 mata todo
         _fire(daemon, "cleanup")
         daemon.process_manager.kill_cleanup_processes.assert_called_once()
         assert daemon.state_machine.get()["state"] == "IDLE"
@@ -133,7 +133,6 @@ class TestScenarioS2_ReconnectBeforeSuspend:
     def test_reconnect_cancels_both_timers(self, daemon):
         daemon.start_stream()
         daemon.handle_disconnect()
-        _fire(daemon, "disconnect_verify")
         assert daemon.state_machine.get()["state"] == "GRACE_PERIOD"
 
         # User vuelve antes de los 20m
@@ -152,7 +151,6 @@ class TestScenarioS3_ReconnectAfterSuspend:
     def test_reconnect_resumes_immediately(self, daemon):
         daemon.start_stream()
         daemon.handle_disconnect()
-        _fire(daemon, "disconnect_verify")
 
         # 20m: suspend
         _fire(daemon, "suspend")
@@ -177,7 +175,6 @@ class TestScenarioS4_NoReconnect:
     def test_kills_after_full_grace_period(self, daemon):
         daemon.start_stream()
         daemon.handle_disconnect()
-        _fire(daemon, "disconnect_verify")
         _fire(daemon, "suspend")
         _fire(daemon, "cleanup")
 
@@ -208,7 +205,6 @@ class TestScenarioS6_RedundantDisconnects:
     def test_multiple_disconnects_preserve_original_deadline(self, daemon):
         daemon.start_stream()
         daemon.handle_disconnect()
-        _fire(daemon, "disconnect_verify")
         original_deadline = daemon.timer_deadlines["cleanup"]
 
         # 5 desconexiones repetidas (ej: script que reintenta)
@@ -218,20 +214,24 @@ class TestScenarioS6_RedundantDisconnects:
         assert daemon.timer_deadlines["cleanup"] == original_deadline
 
 
-class TestScenarioS7_FalseDisconnect:
-    """Si el proceso de stream sigue vivo, debe volver a STREAMING."""
+class TestScenarioS7_SunshineDetachIsAuthoritative:
+    """Regression: even when sunshine.exe is reported alive, /disconnect must
+    transition to GRACE_PERIOD. The old verification step would trap the
+    daemon in STREAMING forever because sunshine.exe runs as a service and
+    is_stream_alive() always returned True.
+    """
 
-    def test_false_disconnect_returns_to_streaming(self, daemon):
+    def test_disconnect_advances_even_if_stream_process_alive(self, daemon):
         daemon.start_stream()
-        daemon.handle_disconnect()
-
-        # El proceso Sunshine sigue vivo, falsa alarma
+        # Sunshine.exe sigue vivo (siempre lo está) — antes esto se trataba
+        # como falsa alarma. Ahora confiamos en detach-cmd.
         daemon.process_manager.is_stream_alive.return_value = True
-        _fire(daemon, "disconnect_verify")
 
-        assert daemon.state_machine.get()["state"] == "STREAMING"
-        assert "cleanup" not in daemon.timers
-        assert "suspend" not in daemon.timers
+        daemon.handle_disconnect(reason="detach_cmd")
+
+        assert daemon.state_machine.get()["state"] == "GRACE_PERIOD"
+        assert "cleanup" in daemon.timers
+        assert "suspend" in daemon.timers
 
 
 class TestScenarioS8_CleanupSurvivesException:
@@ -240,7 +240,6 @@ class TestScenarioS8_CleanupSurvivesException:
     def test_cleanup_exception_still_resets_to_idle(self, daemon):
         daemon.start_stream()
         daemon.handle_disconnect()
-        _fire(daemon, "disconnect_verify")
 
         daemon.process_manager.kill_cleanup_processes.side_effect = OSError("hardware busy")
         _fire(daemon, "cleanup")

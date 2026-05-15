@@ -95,38 +95,32 @@ def _fire_named_timer(daemon, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 class TestDisconnectFlow:
-    def test_disconnect_from_streaming_goes_to_possible_disconnect(self, daemon):
+    """Sunshine's detach-cmd is authoritative — /disconnect goes straight to
+    GRACE_PERIOD. There is no verification step: is_stream_alive() only checks
+    whether sunshine.exe is running (always true, it's a service), so any
+    verification would always conclude 'false disconnect' and trap the daemon
+    in STREAMING forever.
+    """
+
+    def test_disconnect_from_streaming_goes_straight_to_grace_period(self, daemon):
         daemon.state_machine.transition("STREAMING")
         daemon.handle_disconnect()
-        assert daemon.state_machine.get()["state"] == "POSSIBLE_DISCONNECT"
-        assert "disconnect_verify" in daemon.timers
-        assert "possible_disconnect_deadline" in daemon.timers
-
-    def test_verify_disconnect_returns_to_streaming_if_alive(self, daemon):
-        daemon.state_machine.transition("STREAMING")
-        daemon.handle_disconnect()
-        daemon.process_manager.is_stream_alive.return_value = True
-
-        _fire_named_timer(daemon, "disconnect_verify")
-
-        assert daemon.state_machine.get()["state"] == "STREAMING"
-
-    def test_verify_disconnect_advances_to_grace_period_if_dead(self, daemon):
-        daemon.state_machine.transition("STREAMING")
-        daemon.handle_disconnect()
-        daemon.process_manager.is_stream_alive.return_value = False
-
-        _fire_named_timer(daemon, "disconnect_verify")
-
         assert daemon.state_machine.get()["state"] == "GRACE_PERIOD"
         assert "cleanup" in daemon.timers
         assert "suspend" in daemon.timers
+        # Verification timers must NOT be scheduled — they would falsely
+        # return to STREAMING because sunshine.exe is always alive.
+        assert "disconnect_verify" not in daemon.timers
+        assert "possible_disconnect_deadline" not in daemon.timers
 
-    def test_possible_disconnect_deadline_advances_to_grace(self, daemon):
+    def test_disconnect_does_not_consult_is_stream_alive(self, daemon):
+        """Regression: even when sunshine.exe is alive, /disconnect must
+        transition to GRACE_PERIOD — Sunshine fires detach-cmd only on real
+        client disconnects, so we trust it."""
         daemon.state_machine.transition("STREAMING")
-        daemon.handle_disconnect()
+        daemon.process_manager.is_stream_alive.return_value = True
 
-        _fire_named_timer(daemon, "possible_disconnect_deadline")
+        daemon.handle_disconnect()
 
         assert daemon.state_machine.get()["state"] == "GRACE_PERIOD"
 
