@@ -209,20 +209,21 @@ class SunshineDaemon:
         return self.state_machine.get()
 
     def handle_disconnect(self, reason: str = "disconnect") -> dict:
+        # Sunshine's detach-cmd is the authoritative signal that the client
+        # disconnected. is_stream_alive() only checks whether sunshine.exe is
+        # running — and it always is, because Sunshine runs as a service — so
+        # any verification step here would always conclude "false disconnect"
+        # and trap us in STREAMING forever.
         current_state = self.state_machine.get()["state"]
         self.audit("disconnect", reason=reason)
 
-        if current_state == "STREAMING":
-            self.state_machine.transition("POSSIBLE_DISCONNECT")
-            self._schedule_verify_disconnect()
-            self._schedule_possible_disconnect_deadline()
+        if current_state in {"STREAMING", "IDLE", "STARTING"}:
+            self.state_machine.transition("GRACE_PERIOD")
+            self._schedule_cleanup()
         elif current_state == "GRACE_PERIOD":
             # Cleanup timer is already counting down; a redundant disconnect
             # event must not reset it or processes would never be cleaned up.
             logger.info("Disconnect received in GRACE_PERIOD — cleanup timer already running, ignoring")
-        elif current_state in {"IDLE", "STARTING"}:
-            self.state_machine.transition("GRACE_PERIOD")
-            self._schedule_cleanup()
 
         return self.state_machine.get()
 
