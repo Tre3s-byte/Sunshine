@@ -133,8 +133,8 @@ class SunshineDaemon:
             self.state_machine.transition("GRACE_PERIOD")
             self._schedule_cleanup()
         elif recovered_state == "GRACE_PERIOD":
-            logger.info("Startup: recovered GRACE_PERIOD — re-scheduling cleanup timer")
-            self._schedule_cleanup()
+            logger.info("Startup: recovered GRACE_PERIOD — re-scheduling cleanup timer from persisted deadline")
+            self._schedule_cleanup(grace_started_at=self.state_machine.get()["state_entered_at"])
         elif recovered_state == "CLEANING":
             logger.info("Startup: recovered CLEANING state — re-running cleanup")
             threading.Thread(
@@ -176,7 +176,7 @@ class SunshineDaemon:
             self.timers.clear()
             self.timer_deadlines.clear()
 
-    def _schedule_timer(self, name: str, delay: int, fn, **kwargs) -> None:
+    def _schedule_timer(self, name: str, delay: int | float, fn, **kwargs) -> None:
         timer = threading.Timer(delay, fn, kwargs=kwargs if kwargs else None)
         timer.daemon = True
         with self.timer_lock:
@@ -223,7 +223,16 @@ class SunshineDaemon:
         elif current_state == "GRACE_PERIOD":
             # Cleanup timer is already counting down; a redundant disconnect
             # event must not reset it or processes would never be cleaned up.
-            logger.info("Disconnect received in GRACE_PERIOD — cleanup timer already running, ignoring")
+            # If the in-memory timer was lost (for example after an unusual
+            # recovery path), recreate it from the persisted state-entry time
+            # without extending the original deadline.
+            with self.timer_lock:
+                cleanup_missing = "cleanup" not in self.timers
+            if cleanup_missing:
+                logger.warning("Disconnect received in GRACE_PERIOD but cleanup timer is missing — rebuilding deadline")
+                self._schedule_cleanup(grace_started_at=self.state_machine.get()["state_entered_at"])
+            else:
+                logger.info("Disconnect received in GRACE_PERIOD — cleanup timer already running, ignoring")
 
         return self.state_machine.get()
 
@@ -282,20 +291,53 @@ class SunshineDaemon:
         self.state_machine.transition("GRACE_PERIOD")
         self._schedule_cleanup()
 
-    def _schedule_cleanup(self) -> None:
+    def _schedule_cleanup(self, grace_started_at: int | float | None = None) -> None:
         self.cancel_timers()
         timers_cfg = self.config.get("timers", {})
         cleanup_delay = int(timers_cfg.get("cleanup_seconds", 3600))
         suspend_delay = int(timers_cfg.get("suspend_seconds", 1200))
+        elapsed = 0.0
+        if grace_started_at is not None:
+            elapsed = max(0.0, time.time() - float(grace_started_at))
 
-        # Tier 1: suspend games to free GPU/RAM while preserving game state in memory
+        cleanup_remaining = cleanup_delay - elapsed
+        if cleanup_remaining <= 0:
+            logger.info(
+                "Grace-period cleanup deadline already expired (elapsed=%.0fs, cleanup=%ss) — cleaning now",
+                elapsed,
+                cleanup_delay,
+            )
+            threading.Thread(
+                target=self.cleanup,
+                kwargs={"reason": "grace_period_expired"},
+                daemon=True,
+            ).start()
+            return
+
+        # Tier 1: suspend games to free GPU/RAM while preserving game state in memory.
+        # When recovering a GRACE_PERIOD after restart, use elapsed time so the
+        # suspend and cleanup deadlines remain anchored to the original disconnect.
         if 0 < suspend_delay < cleanup_delay:
-            self._schedule_timer("suspend", suspend_delay, self._suspend_games_tier1)
-            logger.info("Suspend tier-1 scheduled in %ss", suspend_delay)
+            suspend_remaining = suspend_delay - elapsed
+            if suspend_remaining > 0:
+                self._schedule_timer("suspend", suspend_remaining, self._suspend_games_tier1)
+                logger.info("Suspend tier-1 scheduled in %.0fs", suspend_remaining)
+            else:
+                logger.info(
+                    "Suspend tier-1 deadline already passed (elapsed=%.0fs, suspend=%ss) — applying now",
+                    elapsed,
+                    suspend_delay,
+                )
+                self._suspend_games_tier1()
 
         # Tier 2: full cleanup — kill everything
-        self._schedule_timer("cleanup", cleanup_delay, self.cleanup, reason="grace_period_expired")
-        logger.info("Cleanup scheduled in %ss", cleanup_delay)
+        self._schedule_timer("cleanup", cleanup_remaining, self.cleanup, reason="grace_period_expired")
+        logger.info(
+            "Cleanup scheduled in %.0fs (elapsed grace=%.0fs, configured cleanup=%ss)",
+            cleanup_remaining,
+            elapsed,
+            cleanup_delay,
+        )
 
     def _suspend_games_tier1(self) -> None:
         """Tier-1 timer fired: suspend games to free GPU/RAM while preserving state."""
@@ -342,9 +384,19 @@ class SunshineDaemon:
                 timers[name] = max(0, int(deadline - now))
 
         session_start = self.session_tracker.start_time
+        timers_cfg = self.config.get("timers", {})
+        cleanup_seconds = int(timers_cfg.get("cleanup_seconds", 3600))
+        state_elapsed_seconds = max(0, int(now - state.get("state_entered_at", now)))
+        grace_cleanup_due_at = None
+        if state["state"] == "GRACE_PERIOD":
+            grace_cleanup_due_at = int(state["state_entered_at"] + cleanup_seconds)
+
         return {
             **state,
+            "state_elapsed_seconds": state_elapsed_seconds,
             "timers_remaining_seconds": timers,
+            "configured_cleanup_seconds": cleanup_seconds,
+            "grace_cleanup_due_at": grace_cleanup_due_at,
             "session_start": int(session_start) if session_start else None,
             "session_duration_seconds": int(now - session_start) if session_start else None,
             "connection_active": self.process_manager.is_connection_active(),

@@ -48,6 +48,19 @@ class TestStateMachine:
         assert sm.get()["state"] == "GRACE_PERIOD"
         assert sm.get()["generation"] == 7
 
+    def test_restore_uses_legacy_timestamp_as_state_entered_at(self, tmp_state_path: Path, silent_logger):
+        tmp_state_path.write_text(json.dumps(
+            {"state": "GRACE_PERIOD", "generation": 7, "timestamp": 12345}
+        ))
+        sm = StateMachine(tmp_state_path, silent_logger)
+        assert sm.get()["state_entered_at"] == 12345
+
+    def test_transition_persists_state_entered_at(self, tmp_state_path: Path, silent_logger):
+        sm = StateMachine(tmp_state_path, silent_logger)
+        sm.transition("GRACE_PERIOD")
+        data = json.loads(tmp_state_path.read_text())
+        assert isinstance(data["state_entered_at"], int)
+
     def test_restore_corrupt_falls_back_to_idle(self, tmp_state_path: Path, silent_logger):
         tmp_state_path.write_text("not-json{{{")
         sm = StateMachine(tmp_state_path, silent_logger)
